@@ -4,11 +4,14 @@
  * Reads GPU temperatures through NVML (libnvidia-ml.so.1, loaded at runtime
  * with dlopen, so no CUDA headers are needed to build), maps each blower's
  * GPUs through its own fan curve, and sends "SET d1 d2" to the XIAO RP2040
- * controller over USB CDC. Reads back STAT (tach RPM).
+ * controller over USB CDC. Reads back STAT (tach RPM, stall state).
+ * Minimum duty and tach/stall settings live in the controller
+ * (MIN / TACH commands, saved to its flash) - set them with -s.
  *
  * Build:   gcc -O2 -Wall -o fanctl fanctl.c -ldl
- * Run:     fanctl [-c /etc/fanctl.conf] [-p /dev/fanctl] [-v] [-1]
- *          -1  print one status line from the controller and exit
+ * Run:     fanctl [-c /etc/fanctl.conf] [-p /dev/fanctl] [-v] [-1] [-s CMD]
+ *          -1      print one status line from the controller and exit
+ *          -s CMD  send one command (e.g. "MIN 35 35") and print the reply
  *
  * Failure handling:
  *   - A blower whose GPU can't be read (NVML error, GPU gone) gets fail_duty.
@@ -57,7 +60,6 @@ typedef struct {
     int    gpu[MAX_GPUS];
     int    npts;
     double t[MAX_PTS], d[MAX_PTS];
-    int    tach;                 /* 1 = blower has a tach wire */
 } fan_cfg_t;
 
 typedef struct {
@@ -65,7 +67,6 @@ typedef struct {
     double    interval;          /* s, must be < 10 (controller timeout) */
     double    ramp_down;         /* max % decrease per update */
     int       fail_duty;
-    int       stall_min_duty;    /* warn if duty >= this and rpm == 0 */
     fan_cfg_t fan[2];
 } cfg_t;
 
@@ -112,12 +113,10 @@ static int load_config(const char *path, cfg_t *c) {
     c->interval = 2.0;
     c->ramp_down = 3.0;
     c->fail_duty = 100;
-    c->stall_min_duty = 30;
     parse_gpus("0,1", &c->fan[0]);
     parse_gpus("2,3", &c->fan[1]);
     for (int i = 0; i < 2; i++) {
-        parse_curve("40:0,50:30,70:70,82:100", &c->fan[i]);
-        c->fan[i].tach = 1;
+        parse_curve("40:35,55:45,70:70,82:100", &c->fan[i]);
     }
 
     FILE *fp = fopen(path, "r");
@@ -143,13 +142,11 @@ static int load_config(const char *path, cfg_t *c) {
         else if (!strcmp(k, "interval"))       c->interval = atof(v);
         else if (!strcmp(k, "ramp_down"))      c->ramp_down = atof(v);
         else if (!strcmp(k, "fail_duty"))      c->fail_duty = atoi(v);
-        else if (!strcmp(k, "stall_min_duty")) c->stall_min_duty = atoi(v);
         else if (!strncmp(k, "fan", 3) && (k[3] == '1' || k[3] == '2') && k[4] == '_') {
             fan_cfg_t *f = &c->fan[k[3] - '1'];
             const char *sub = k + 5;
             if      (!strcmp(sub, "gpus"))  ok = parse_gpus(v, f) == 0;
             else if (!strcmp(sub, "curve")) ok = parse_curve(v, f) == 0;
-            else if (!strcmp(sub, "tach"))  f->tach = atoi(v);
             else ok = 0;
         } else ok = 0;
         if (!ok) { logmsg(LOG_ERR, "%s:%d: bad setting '%s'", path, ln, k); bad = 1; }
@@ -322,6 +319,9 @@ static int ser_open(const char *port) {
         return -1;
     }
     logmsg(LOG_INFO, "connected to %s: %s", port, id);
+    char c[128];
+    if (ser_cmd("CFG", c, sizeof c) == 0 && strncmp(c, "CFG", 3) == 0)
+        logmsg(LOG_INFO, "controller %s", c);
     return 0;
 }
 
@@ -354,15 +354,23 @@ static double mono(void) {
 
 int main(int argc, char **argv) {
     const char *cfg_path = "/etc/fanctl.conf", *port_override = NULL;
+    const char *raw_cmd = NULL;
     int once = 0, opt;
-    while ((opt = getopt(argc, argv, "c:p:v1h")) != -1) {
+    while ((opt = getopt(argc, argv, "c:p:s:v1h")) != -1) {
         switch (opt) {
         case 'c': cfg_path = optarg; break;
         case 'p': port_override = optarg; break;
+        case 's': raw_cmd = optarg; break;
         case 'v': verbose = 1; break;
         case '1': once = 1; break;
         default:
-            fprintf(stderr, "usage: %s [-c config] [-p port] [-v] [-1]\n", argv[0]);
+            fprintf(stderr,
+                "usage: %s [-c config] [-p port] [-v] [-1] [-s \"CMD\"]\n"
+                "  -1        print one STAT line and exit\n"
+                "  -s CMD    send one command and print the reply, e.g.\n"
+                "            -s \"SET 40 40\"  -s \"MIN 35 35\"  -s \"TACH 1 0\"  -s CFG\n"
+                "            (stop the fanctl service first, or it will override SET)\n",
+                argv[0]);
             return 2;
         }
     }
@@ -372,11 +380,12 @@ int main(int argc, char **argv) {
     if (load_config(cfg_path, &cfg) < 0) return 1;
     if (port_override) snprintf(cfg.port, sizeof cfg.port, "%s", port_override);
 
-    if (once) {
+    if (once || raw_cmd) {
         char reply[256];
-        if (ser_open(cfg.port) < 0 || ser_cmd("GET", reply, sizeof reply) < 0) return 1;
+        if (ser_open(cfg.port) < 0 || ser_cmd(raw_cmd ? raw_cmd : "GET", reply, sizeof reply) < 0)
+            return 1;
         printf("%s\n", reply);
-        return 0;
+        return strncmp(reply, "ERR", 3) == 0;
     }
 
     struct sigaction sa = { .sa_handler = on_signal };
@@ -385,7 +394,8 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 
     double duty[2] = { -1, -1 };     /* -1 = not yet set */
-    int    last_logged[2] = { -1, -1 }, stall_n[2] = { 0, 0 };
+    int    last_logged[2] = { -1, -1 }, was_stalled[2] = { 0, 0 };
+    char   last_st[2][16] = { "", "" };
     double t_log = 0, t_nvml_retry = 0, t_nvml_reinit = 0;
 
     while (running) {
@@ -444,22 +454,29 @@ int main(int argc, char **argv) {
         stat_get(reply, "rpm1", rpm[0], sizeof rpm[0]);
         stat_get(reply, "rpm2", rpm[1], sizeof rpm[1]);
 
+        /* firmware-side stall recovery: st1/st2 = OFF | OK | KICK | STALL */
+        char st[2][16];
+        stat_get(reply, "st1", st[0], sizeof st[0]);
+        stat_get(reply, "st2", st[1], sizeof st[1]);
+
         int changed = 0;
         for (int i = 0; i < 2; i++) {
             int d = (int)lround(duty[i]);
             if (abs(d - last_logged[i]) >= 5) changed = 1;
-            fan_cfg_t *f = &cfg.fan[i];
-            if (f->tach && cfg.stall_min_duty > 0 && d >= cfg.stall_min_duty && !strcmp(rpm[i], "0")) {
-                if (++stall_n[i] == 3 || stall_n[i] % 30 == 0)
-                    logmsg(LOG_WARN, "fan%d: no tach at %d%% duty - stalled or unplugged?", i + 1, d);
-            } else {
-                stall_n[i] = 0;
-            }
+            int stalled = !strcmp(st[i], "STALL");
+            if (stalled && !was_stalled[i])
+                logmsg(LOG_ERR, "fan%d STALLED: no tach after recovery kicks - held at 100%%", i + 1);
+            else if (!stalled && was_stalled[i])
+                logmsg(LOG_WARN, "fan%d recovered from stall (%s rpm)", i + 1, rpm[i]);
+            else if (!strcmp(st[i], "KICK") && !strcmp(last_st[i], "OK"))
+                logmsg(LOG_WARN, "fan%d lost tach - firmware recovery kick", i + 1);
+            was_stalled[i] = stalled;
+            snprintf(last_st[i], sizeof last_st[i], "%s", st[i]);
         }
         if (verbose || changed || t_start - t_log >= 60) {
-            logmsg(LOG_INFO, "fan1 gpu[%s] %d%% %s rpm | fan2 gpu[%s] %d%% %s rpm",
-                   temps[0], (int)lround(duty[0]), rpm[0],
-                   temps[1], (int)lround(duty[1]), rpm[1]);
+            logmsg(LOG_INFO, "fan1 gpu[%s] %d%% %s rpm %s | fan2 gpu[%s] %d%% %s rpm %s",
+                   temps[0], (int)lround(duty[0]), rpm[0], st[0],
+                   temps[1], (int)lround(duty[1]), rpm[1], st[1]);
             last_logged[0] = (int)lround(duty[0]);
             last_logged[1] = (int)lround(duty[1]);
             t_log = t_start;

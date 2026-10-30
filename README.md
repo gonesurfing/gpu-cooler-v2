@@ -23,8 +23,8 @@ Wiring, build and install steps, and failure behaviour are documented in
 
 ## Requirements
 
-- **Firmware:** Pico SDK 2.3.1 (the Raspberry Pi Pico VS Code extension sets
-  this up), ARM GCC toolchain
+- **Firmware:** Pico SDK 2.3.1 and its toolchain, installed by the Raspberry
+  Pi Pico VS Code extension (or set `PICO_SDK_PATH` yourself)
 - **Host:** Linux with the NVIDIA driver (`libnvidia-ml.so.1`), systemd, a C
   compiler. No CUDA toolkit needed; NVML is loaded at runtime.
 
@@ -45,6 +45,8 @@ with `nvidia-smi -L`) and tune the fan curves.
 
 ## Safety
 
-The controller fails toward cooling: if the daemon stops talking to it for
-10 s, after a reset, or until the first command arrives, both blowers run at
-100 %. A blower whose GPU can't be read also goes to full speed.
+The controller fails toward cooling: at power-up until the first command
+arrives, and whenever the daemon stops talking to it for 10 s, both blowers
+run at 100 %. A blower whose GPU can't be read also goes to full speed. If a
+blower stalls, the firmware kicks it at full power to restart it and, if that
+fails, holds it at 100 % and reports the stall to the daemon's log.
