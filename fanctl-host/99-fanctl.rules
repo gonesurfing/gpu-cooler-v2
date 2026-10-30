@@ -1,0 +1,5 @@
+# /etc/udev/rules.d/99-fanctl.rules
+# Stable /dev/fanctl symlink for the XIAO RP2040 fan controller.
+# If you have other Pico-SDK USB devices attached, add a serial match:
+#   ATTRS{serial}=="<from: udevadm info -a -n /dev/ttyACM0 | grep serial>"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000a", SYMLINK+="fanctl", MODE="0660", GROUP="dialout"

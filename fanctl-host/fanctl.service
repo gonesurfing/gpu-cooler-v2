@@ -1,0 +1,15 @@
+# /etc/systemd/system/fanctl.service
+[Unit]
+Description=GPU blower controller (XIAO RP2040)
+After=nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+ExecStart=/usr/local/bin/fanctl -c /etc/fanctl.conf
+Restart=always
+RestartSec=5
+DynamicUser=yes
+SupplementaryGroups=dialout video
+
+[Install]
+WantedBy=multi-user.target
