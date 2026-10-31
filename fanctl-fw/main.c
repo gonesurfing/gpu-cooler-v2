@@ -12,8 +12,8 @@
  *   GP0 (D6)  PWM1        slice 0 A
  *   GP1 (D7)  PWM2        slice 0 B
  *   GP6 (D4)  EN          DRV8871 IN1, both channels (unused for LOWSIDE)
- *   GP3 (D10) TACH1       slice 1 B, falling-edge counter
- *   GP7 (D5)  TACH2       slice 3 B, falling-edge counter
+ *   GP7 (D5)  TACH1       slice 3 B, falling-edge counter
+ *   GP3 (D10) TACH2       slice 1 B, falling-edge counter
  *
  * USB CDC protocol, one command per line, case-insensitive:
  *   SET <d1> [<d2>]    duty % per blower (one value = both)       -> STAT
@@ -61,8 +61,8 @@
 #define PIN_PWM1           0
 #define PIN_PWM2           1
 #define PIN_EN             6
-#define PIN_TACH1          3
-#define PIN_TACH2          7
+#define PIN_TACH1          7
+#define PIN_TACH2          3
 
 #if FANCTL_DRIVER == DRV_DRV8871
 #define PWM_FREQ_HZ        25000

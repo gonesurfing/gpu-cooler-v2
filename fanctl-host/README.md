@@ -17,7 +17,7 @@ Schematic: `fan_controller.kicad_sch` (rev C, carrier board for the modules).
 | XIAO D7 / GP1 (PWM2) | module 2 IN2 |
 | Module OUT1 / OUT2 | blower red (+) / black (-) |
 | Blower blue (FG) | 10k pull-up to 3V3, then 1k to GPIO, 47 nF GPIO-to-GND |
-| XIAO D10 / GP3, D5 / GP7 | TACH1, TACH2 |
+| XIAO D5 / GP7, D10 / GP3 | TACH1, TACH2 |
 | XIAO USB-C | motherboard internal 9-pin USB 2.0 header |
 
 - R1-R3 (100k) hold IN1/IN2 low during boot, so the DRV8871s sleep and the
@@ -83,6 +83,19 @@ removes everything except `/etc/fanctl.conf`.
 `fanctl -1` prints one status line, `fanctl -s "CMD"` sends one command,
 `fanctl -v` logs every update. Set `fan1_gpus` / `fan2_gpus` in
 `/etc/fanctl.conf` so each blower follows its own K80 (`nvidia-smi -L`).
+
+## Testing without GPUs (e.g. on a Mac)
+
+`make fake-nvml` builds `test/libnvidia-ml.so.1`, a stand-in NVML that reads
+GPU temperatures from a text file, one value per GPU (`fail` = unreadable).
+The file is re-read every update, so edit it while fanctl runs:
+
+    make && make fake-nvml
+    echo "45 47 60 62" > fake-temps
+    DYLD_LIBRARY_PATH=test ./fanctl -c fanctl.conf -p /dev/cu.usbmodem* -v
+    # Linux: LD_LIBRARY_PATH=test ./fanctl -c fanctl.conf -p /dev/ttyACM0 -v
+
+On macOS use the `/dev/cu.*` port, not `/dev/tty.*`.
 
 ## Failure behaviour
 

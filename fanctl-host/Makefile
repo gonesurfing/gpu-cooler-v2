@@ -2,6 +2,7 @@
 #   make                 build ./fanctl
 #   sudo make install    install binary, config (kept if present), udev rule, service; (re)start
 #   sudo make uninstall  stop and remove everything except /etc/fanctl.conf
+#   make fake-nvml       build test/libnvidia-ml.so.1, a stand-in NVML for testing
 
 CFLAGS  ?= -O2 -Wall
 LDLIBS  := -ldl -lm
@@ -31,7 +32,12 @@ uninstall:
 	systemctl daemon-reload
 	udevadm control --reload
 
-clean:
-	rm -f fanctl
+fake-nvml: test/libnvidia-ml.so.1
 
-.PHONY: install uninstall clean
+test/libnvidia-ml.so.1: test/fake_nvml.c
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ $<
+
+clean:
+	rm -f fanctl test/libnvidia-ml.so.1
+
+.PHONY: install uninstall clean fake-nvml
