@@ -1,5 +1,5 @@
 /*
- * fanctl firmware v2.2 - XIAO RP2040, two blowers, USB CDC control
+ * fanctl firmware v2.3 - XIAO RP2040, two blowers, USB CDC control
  *
  * Driver stage (pick at build time, cmake -DFANCTL_DRIVER=...):
  *   DRV8871  (default) One DRV8871 per blower. IN1 <- EN (GP6, shared),
@@ -14,6 +14,8 @@
  *   GP6 (D4)  EN          DRV8871 IN1, both channels (unused for LOWSIDE)
  *   GP7 (D5)  TACH1       slice 3 B, falling-edge counter
  *   GP3 (D10) TACH2       slice 1 B, falling-edge counter
+ *   GP16/17/25            small green / red / blue LEDs (active low)
+ *   GP12, GP11            RGB LED (WS2812, via PIO) data, power enable
  *
  * USB CDC protocol, one command per line, case-insensitive:
  *   SET <d1> [<d2>]    duty % per blower (one value = both)       -> STAT
@@ -22,13 +24,16 @@
  *   TACH <t1> [<t2>]   1 = blower has tach (enables stall
  *                      recovery), 0 = none; saved to flash        -> CFG
  *   CFG                                                           -> CFG
+ *   TEMP <t1> [<t2>]   GPU temperature per blower in C for the RGB LED,
+ *                      -1 = unknown; forgotten after HOST_TIMEOUT_MS -> TEMP
  *   PROBE <ms> [<f>]   debug: blower f (default 1) at 100 % for ms,
  *                      tach falling-edge times in ms              -> PROBE
- *   ID                                                            -> ID FANCTL 2.2 <driver>
+ *   ID                                                            -> ID FANCTL 2.3 <driver>
  *
  *   STAT mode=HOST d1=70 rpm1=2040 st1=OK d2=30 rpm2=1280 st2=OK
  *   CFG min1=30 min2=30 tach1=1 tach2=1
  *   PROBE fan=1 ms=50 n=3 t=2.62,26.46,50.01
+ *   TEMP t1=55 t2=62
  *
  *   mode: HOST | LOST (no SET yet, or none for HOST_TIMEOUT_MS; both blowers 100 %)
  *   d:    output level actually applied (see speed levels), not the request
@@ -61,6 +66,16 @@
  * RECOVER_KICK_MS at 100 % and then returns to its setting. The level is
  * honoured in the reported duty throughout; st= shows what the output is
  * actually doing.
+ *
+ * LEDs (display only, they never affect control):
+ *   small green  host link up (mode=HOST)
+ *   small blue   flickers on every command line received
+ *   small red    a blower is latched in STALL
+ *   RGB          blinks red while LOST or any blower is in STALL; otherwise
+ *                cycles over the running blowers: one blue flash then blower
+ *                1's temperature colour, two flashes then blower 2's.
+ *                Green <= LED_TEMP_COOL, through yellow, orange >= LED_TEMP_HOT;
+ *                dim white if no temperature.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,6 +88,9 @@
 #include "hardware/watchdog.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
+#include "hardware/pio.h"
+
+#include "ws2812.pio.h"
 
 #define DRV_LOWSIDE 1
 #define DRV_DRV8871 2
@@ -86,6 +104,11 @@
 #define PIN_EN             6
 #define PIN_TACH1          7
 #define PIN_TACH2          3
+#define PIN_LED_GREEN      16      /* small user LEDs, active low */
+#define PIN_LED_RED        17
+#define PIN_LED_BLUE       25
+#define PIN_RGB            12      /* WS2812 data */
+#define PIN_RGB_POWER      11
 
 #if FANCTL_DRIVER == DRV_DRV8871
 #define PWM_FREQ_HZ        25000
@@ -125,6 +148,11 @@
 #define PROBE_FAILS        3       /* failed samples in a row = stall */
 #define PROBE_MIN_RPM      1000    /* slower than this counts as failed */
 #define PROBE_BLANK_US     300     /* ignore tach edges closer than this */
+
+#define LED_BRIGHTNESS     64      /* RGB LED, of 255 */
+#define LED_TEMP_COOL      40      /* C: green at or below */
+#define LED_TEMP_HOT       82      /* C: orange at or above */
+#define LED_BLUE_MS        100     /* small blue flicker per command */
 
 /* ---------------- persistent settings (last flash sector) ---------------- */
 #define CFG_MAGIC   0x46414E31u               /* "FAN1" */
@@ -193,16 +221,19 @@ typedef struct {
     bool        probe_settled;   /* follow-up sample done since the last change */
     int         retries;
     uint32_t    rpm;
+    int         temp_c;          /* from TEMP, -1 = unknown */
+    uint32_t    temp_ms;         /* when it arrived */
 } fan_t;
 
 static fan_t fans[2] = {
-    { .pin_pwm = PIN_PWM1, .pin_tach = PIN_TACH1 },
-    { .pin_pwm = PIN_PWM2, .pin_tach = PIN_TACH2 },
+    { .pin_pwm = PIN_PWM1, .pin_tach = PIN_TACH1, .temp_c = -1 },
+    { .pin_pwm = PIN_PWM2, .pin_tach = PIN_TACH2, .temp_c = -1 },
 };
 static uint       pwm_slice;
 static uint32_t   pwm_top;
 static run_mode_t mode = MODE_LOST;
 static uint32_t   last_host_ms;
+static uint32_t   blue_until;
 
 static inline uint32_t now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
 static inline bool after(uint32_t t, uint32_t ref) { return (int32_t)(t - ref) >= 0; }
@@ -405,6 +436,91 @@ static void update_fan(int idx) {
 
 static void update_all(void) { update_fan(0); update_fan(1); }
 
+/* ---------------- LEDs ---------------- */
+static PIO      rgb_pio = pio0;
+static uint     rgb_sm;
+static uint32_t rgb_shown = 0xFFFFFFFFu;
+
+static void leds_init(void) {
+    const uint small[] = { PIN_LED_GREEN, PIN_LED_RED, PIN_LED_BLUE };
+    for (size_t i = 0; i < 3; i++) {
+        gpio_init(small[i]);
+        gpio_set_dir(small[i], GPIO_OUT);
+        gpio_put(small[i], 1);                     /* off */
+    }
+    gpio_init(PIN_RGB_POWER);
+    gpio_set_dir(PIN_RGB_POWER, GPIO_OUT);
+    gpio_put(PIN_RGB_POWER, 1);
+    rgb_sm = (uint)pio_claim_unused_sm(rgb_pio, true);
+    ws2812_program_init(rgb_pio, rgb_sm, pio_add_program(rgb_pio, &ws2812_program),
+                        PIN_RGB, 800000, false);
+}
+
+static uint32_t rgb(int r, int g, int b) {
+    return (uint32_t)(r * LED_BRIGHTNESS / 255) << 16 |
+           (uint32_t)(g * LED_BRIGHTNESS / 255) << 8 | (uint32_t)(b * LED_BRIGHTNESS / 255);
+}
+
+static void rgb_show(uint32_t c) {
+    if (c == rgb_shown) return;
+    rgb_shown = c;
+    uint32_t grb = (c >> 8 & 0xFF) << 16 | (c >> 16 & 0xFF) << 8 | (c & 0xFF);
+    pio_sm_put_blocking(rgb_pio, rgb_sm, grb << 8);
+}
+
+/* green <= LED_TEMP_COOL, yellow halfway, orange >= LED_TEMP_HOT */
+static uint32_t temp_colour(const fan_t *f, uint32_t t) {
+    if (f->temp_c < 0 || t - f->temp_ms > HOST_TIMEOUT_MS) return rgb(96, 96, 96);
+    int x = f->temp_c < LED_TEMP_COOL ? 0 : f->temp_c > LED_TEMP_HOT ? 100 :
+            (f->temp_c - LED_TEMP_COOL) * 100 / (LED_TEMP_HOT - LED_TEMP_COOL);
+    /* WS2812 green is much brighter than red: keep green low for yellow and
+     * orange, or they look alike. green (0,255,0) > yellow (255,160,0) >
+     * orange (255,30,0) */
+    return x <= 50 ? rgb(255 * x / 50, 255 - 95 * x / 50, 0)
+                   : rgb(255, 160 - 130 * (x - 50) / 50, 0);
+}
+
+/* one blower's slot: n blue flashes, then its colour */
+#define FLASH_ON_MS    150
+#define FLASH_OFF_MS   150
+#define COLOUR_MS      1000
+#define SLOT_GAP_MS    400
+
+static uint32_t slot_ms(int n) { return n * (FLASH_ON_MS + FLASH_OFF_MS) + COLOUR_MS + SLOT_GAP_MS; }
+
+static void leds_update(void) {
+    uint32_t t = now_ms();
+    bool stall = fans[0].st == ST_STALL || fans[1].st == ST_STALL;
+
+    gpio_put(PIN_LED_GREEN, mode != MODE_HOST);    /* active low */
+    gpio_put(PIN_LED_RED, !stall);
+    gpio_put(PIN_LED_BLUE, after(t, blue_until));
+
+    if (stall || mode == MODE_LOST) {              /* trouble: blink red */
+        rgb_show(t / 250 % 2 ? 0 : rgb(255, 0, 0));
+        return;
+    }
+
+    uint32_t cycle = 0;
+    for (int i = 0; i < 2; i++)
+        if (fans[i].st != ST_OFF) cycle += slot_ms(i + 1);
+    if (cycle == 0) { rgb_show(0); return; }
+
+    uint32_t pos = t % cycle;
+    for (int i = 0; i < 2; i++) {
+        if (fans[i].st == ST_OFF) continue;
+        if (pos >= slot_ms(i + 1)) { pos -= slot_ms(i + 1); continue; }
+        uint32_t flashes = (uint32_t)(i + 1) * (FLASH_ON_MS + FLASH_OFF_MS);
+        if (pos < flashes)
+            rgb_show(pos % (FLASH_ON_MS + FLASH_OFF_MS) < FLASH_ON_MS ? rgb(0, 0, 255) : 0);
+        else if (pos < flashes + COLOUR_MS)
+            rgb_show(temp_colour(&fans[i], t));
+        else
+            rgb_show(0);
+        return;
+    }
+}
+
 /* ---------------- protocol ---------------- */
 static const char *mode_name(void) {
     return mode == MODE_HOST ? "HOST" : "LOST";
@@ -461,6 +577,7 @@ static void handle_line(char *s) {
     for (char *p = s; *p; p++) *p = (char)toupper((unsigned char)*p);
     while (*s == ' ') s++;
     int v[2];
+    if (*s) blue_until = now_ms() + LED_BLUE_MS;
 
     if (strncmp(s, "SET", 3) == 0) {
         if (!parse_pair(s + 3, 0, 100, v)) { printf("ERR SET 0-100 [0-100]\n"); return; }
@@ -487,6 +604,13 @@ static void handle_line(char *s) {
         print_cfg();
     } else if (strcmp(s, "CFG") == 0) {
         print_cfg();
+    } else if (strncmp(s, "TEMP", 4) == 0) {
+        if (!parse_pair(s + 4, -1, 150, v)) { printf("ERR TEMP -1-150 [-1-150]\n"); return; }
+        for (int i = 0; i < 2; i++) {
+            fans[i].temp_c = v[i];
+            fans[i].temp_ms = now_ms();
+        }
+        printf("TEMP t1=%d t2=%d\n", v[0], v[1]);
     } else if (strncmp(s, "PROBE", 5) == 0) {
         char *end;
         long ms = strtol(s + 5, &end, 10);
@@ -494,7 +618,7 @@ static void handle_line(char *s) {
         if (ms < 1 || ms > 500 || fan < 1 || fan > 2) { printf("ERR PROBE 1-500 [1|2]\n"); return; }
         print_probe((int)fan - 1, (int)ms);
     } else if (strcmp(s, "ID") == 0) {
-        printf("ID FANCTL 2.2 %s\n", DRIVER_NAME);
+        printf("ID FANCTL 2.3 %s\n", DRIVER_NAME);
     } else if (*s) {
         printf("ERR unknown\n");
     }
@@ -529,6 +653,7 @@ int main(void) {
     tach_init(&fans[0]);
     tach_init(&fans[1]);
     pwm_out_init();
+    leds_init();
     watchdog_enable(2000, true);
 
     uint32_t t_tach = now_ms(), t_ctrl = 0;
@@ -556,6 +681,7 @@ int main(void) {
             t_ctrl = t;
             update_all();
         }
+        leds_update();
         sleep_ms(1);
     }
 }

@@ -47,8 +47,9 @@ Schematic: `fan_controller.kicad_sch` (rev C, carrier board for the modules).
 | `MIN 35 35` | floor under the LOW speed, saved to flash -> `CFG` |
 | `TACH 1 1` | 1 = tach wired (stall recovery on), saved -> `CFG` |
 | `CFG` | `CFG min1=35 min2=35 tach1=1 tach2=1` |
+| `TEMP 55 62` | GPU temperature per blower in C for the LED (`-1` = unknown) -> `TEMP t1=55 t2=62` |
 | `PROBE 100` | debug: blower 1 at 100 % for 100 ms, tach edge times -> `PROBE fan=1 ms=100 n=5 t=5.70,29.44,...` |
-| `ID` | `ID FANCTL 2.2 DRV8871` |
+| `ID` | `ID FANCTL 2.3 DRV8871` |
 
 `st`: `OFF`, `OK`, `KICK` (start-up or recovery kick at 100 %), `STALL`
 (no tach after 3 recovery kicks: held at 100 %, retried every 30 s, clears
@@ -97,6 +98,31 @@ reports that rpm. The tach is valid within a millisecond of steady power and
 the impeller barely speeds up in that time, so the sample matches the real
 speed. A sample with no edges (or under 1000 rpm) is retried after 2 s;
 three misses in a row start the stall recovery below.
+
+## LEDs
+
+Display only; they never change how the blowers are controlled.
+
+| LED | Meaning |
+|---|---|
+| small green | host link up: a `SET` in the last 10 s |
+| small blue | flickers on every command received |
+| small red | a blower is latched in `STALL` |
+| RGB, blinking red | host link lost (incl. power-up until fanctl starts) or a blower in `STALL` |
+| RGB, cycling | one blue flash, then blower 1's GPU temperature as a colour for 1 s; two blue flashes, then blower 2's. Blowers that are off are skipped |
+
+Temperature colours run from green (40 C or less) through yellow to orange
+(82 C or more); dim white means the controller has no temperature for that
+blower (GPU unreadable, or a fanctl older than 2.3). fanctl sends the hottest
+GPU on each blower with `TEMP` after every `SET`; the controller forgets it
+after 10 s.
+
+Troubleshooting at a glance:
+
+- green on, RGB cycling: all good
+- green off, blue flickering: bytes arrive but no valid `SET` - check fanctl's log
+- green off, blue dark: nothing arriving - USB cable / header, udev rule, or fanctl not running
+- small red on: a blower stalled - see `journalctl -u fanctl`
 
 ## Host daemon
 

@@ -251,6 +251,7 @@ static double fan_temp(const fan_cfg_t *f, char *desc, size_t dlen) {
 
 /* ------------------------------------------------------------ serial */
 static int ser_fd = -1;
+static int ctl_has_temp;                 /* controller accepts TEMP (fw 2.3+) */
 static char rxbuf[256];
 static size_t rxlen;
 
@@ -319,6 +320,7 @@ static int ser_open(const char *port) {
         return -1;
     }
     logmsg(LOG_INFO, "connected to %s: %s", port, id);
+    ctl_has_temp = 1;
     char c[128];
     if (ser_cmd("CFG", c, sizeof c) == 0 && strncmp(c, "CFG", 3) == 0)
         logmsg(LOG_INFO, "controller %s", c);
@@ -412,6 +414,7 @@ int main(int argc, char **argv) {
             if (nvml_up() < 0) t_nvml_retry = t_start + 10;
         }
         char temps[2][64];
+        int  hot[2] = { -1, -1 };           /* hottest GPU per blower, for the LED */
         for (int i = 0; i < 2; i++) {
             fan_cfg_t *f = &cfg.fan[i];
             double target;
@@ -426,6 +429,7 @@ int main(int argc, char **argv) {
                     strcpy(temps[i], "FAIL");
                 } else {
                     target = curve_duty(f, t);
+                    hot[i] = (int)lround(t);
                 }
             }
             /* spin up immediately, spin down gradually */
@@ -447,6 +451,19 @@ int main(int argc, char **argv) {
             logmsg(LOG_ERR, "controller did not answer '%s' - reconnecting", cmd);
             ser_close();
             continue;
+        }
+        if (ctl_has_temp) {                  /* temperatures for the controller's LED */
+            char tcmd[32], treply[64];
+            snprintf(tcmd, sizeof tcmd, "TEMP %d %d", hot[0], hot[1]);
+            if (ser_cmd(tcmd, treply, sizeof treply) < 0) {
+                logmsg(LOG_ERR, "controller did not answer '%s' - reconnecting", tcmd);
+                ser_close();
+                continue;
+            }
+            if (strncmp(treply, "ERR", 3) == 0) {
+                logmsg(LOG_INFO, "controller firmware has no TEMP command - LED shows no temperature");
+                ctl_has_temp = 0;
+            }
         }
 
         /* --- report --- */

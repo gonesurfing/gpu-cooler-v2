@@ -27,9 +27,12 @@ set_property(CACHE FANCTL_DRIVER PROPERTY STRINGS LOWSIDE DRV8871)
 
 add_executable(fanctl main.c)
 target_compile_definitions(fanctl PRIVATE FANCTL_DRIVER=DRV_${FANCTL_DRIVER})
+pico_generate_pio_header(fanctl ${CMAKE_CURRENT_LIST_DIR}/ws2812.pio)   # RGB LED
+
 target_link_libraries(fanctl
     pico_stdlib
     hardware_pwm
+    hardware_pio
     hardware_clocks
     hardware_watchdog
     hardware_flash
@@ -39,5 +42,5 @@ pico_enable_stdio_usb(fanctl 1)
 pico_enable_stdio_uart(fanctl 0)
 
 pico_set_program_name(fanctl "fanctl")
-pico_set_program_version(fanctl "2.2")
+pico_set_program_version(fanctl "2.3")
 pico_add_extra_outputs(fanctl)   # fanctl.uf2
