@@ -450,9 +450,12 @@ int main(int argc, char **argv) {
         }
 
         /* --- report --- */
-        char rpm[2][16];
+        char rpm[2][16], out[2][16];
         stat_get(reply, "rpm1", rpm[0], sizeof rpm[0]);
         stat_get(reply, "rpm2", rpm[1], sizeof rpm[1]);
+        /* output level the controller applied (it maps requests to 3 speeds) */
+        stat_get(reply, "d1", out[0], sizeof out[0]);
+        stat_get(reply, "d2", out[1], sizeof out[1]);
 
         /* firmware-side stall recovery: st1/st2 = OFF | OK | KICK | STALL */
         char st[2][16];
@@ -474,9 +477,9 @@ int main(int argc, char **argv) {
             snprintf(last_st[i], sizeof last_st[i], "%s", st[i]);
         }
         if (verbose || changed || t_start - t_log >= 60) {
-            logmsg(LOG_INFO, "fan1 gpu[%s] %d%% %s rpm %s | fan2 gpu[%s] %d%% %s rpm %s",
-                   temps[0], (int)lround(duty[0]), rpm[0], st[0],
-                   temps[1], (int)lround(duty[1]), rpm[1], st[1]);
+            logmsg(LOG_INFO, "fan1 gpu[%s] %d%%->%s%% %s rpm %s | fan2 gpu[%s] %d%%->%s%% %s rpm %s",
+                   temps[0], (int)lround(duty[0]), out[0], rpm[0], st[0],
+                   temps[1], (int)lround(duty[1]), out[1], rpm[1], st[1]);
             last_logged[0] = (int)lround(duty[0]);
             last_logged[1] = (int)lround(duty[1]);
             t_log = t_start;

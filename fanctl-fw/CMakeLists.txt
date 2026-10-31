@@ -39,5 +39,5 @@ pico_enable_stdio_usb(fanctl 1)
 pico_enable_stdio_uart(fanctl 0)
 
 pico_set_program_name(fanctl "fanctl")
-pico_set_program_version(fanctl "2.1")
+pico_set_program_version(fanctl "2.2")
 pico_add_extra_outputs(fanctl)   # fanctl.uf2

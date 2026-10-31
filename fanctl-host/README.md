@@ -43,11 +43,12 @@ Schematic: `fan_controller.kicad_sch` (rev C, carrier board for the modules).
 | Command | Reply |
 |---|---|
 | `SET 40 60` | duty % per blower (`SET 40` = both) -> `STAT` |
-| `GET` | `STAT mode=HOST d1=40 rpm1=1600 st1=OK d2=60 rpm2=2400 st2=OK` |
-| `MIN 35 35` | minimum running duty, saved to flash -> `CFG` |
+| `GET` | `STAT mode=HOST d1=30 rpm1=1280 st1=OK d2=70 rpm2=2040 st2=OK` |
+| `MIN 35 35` | floor under the LOW speed, saved to flash -> `CFG` |
 | `TACH 1 1` | 1 = tach wired (stall recovery on), saved -> `CFG` |
 | `CFG` | `CFG min1=35 min2=35 tach1=1 tach2=1` |
-| `ID` | `ID FANCTL 2.1 DRV8871` |
+| `PROBE 100` | debug: blower 1 at 100 % for 100 ms, tach edge times -> `PROBE fan=1 ms=100 n=5 t=5.70,29.44,...` |
+| `ID` | `ID FANCTL 2.2 DRV8871` |
 
 `st`: `OFF`, `OK`, `KICK` (start-up or recovery kick at 100 %), `STALL`
 (no tach after 3 recovery kicks: held at 100 %, retried every 30 s, clears
@@ -56,19 +57,46 @@ by itself when the tach comes back).
 `mode`: `HOST` or `LOST` (no SET yet since power-up, or none for 10 s: both
 blowers at 100 %).
 
-## Calibrating the minimum duty (do this once per blower)
+`d` is the level actually applied, not the request.
 
-With the fanctl service stopped (`sudo systemctl stop fanctl`):
+### Three speeds
 
-1. `fanctl -s "SET 100"`, then step down 5 % at a time
-   (`fanctl -s "SET 70"`, `fanctl -s "SET 65"`, ...) and check `fanctl -1`
-   after ~5 s each step. Note the duty where a blower's rpm drops to 0, or
-   where it falls back to `KICK` repeatedly.
-2. `fanctl -s "MIN <stall+10> <stall+10>"`, e.g. `MIN 35 40`.
-3. `sudo systemctl start fanctl`.
+With its 12 V chopped by PWM, the BFB1012HH only runs at a few distinct
+speeds, measured on the bench:
 
-Starting from stop is handled by the 1 s kick, so MIN only has to keep a
-blower running, not start it.
+| Duty | Speed |
+|---|---|
+| 20-60 % | ~1280 rpm (all the same) |
+| 70 % | ~2000 rpm |
+| 80-90 % | ~2250-2450 rpm coming from below, ~4200 coming from 100 % |
+| 100 % | ~4200 rpm |
+
+So the firmware maps each request onto three levels and never parks in the
+80-90 % band:
+
+| Request | Level |
+|---|---|
+| 1-49 % | LOW 30 % (~1280 rpm) |
+| 50-89 % | MID 70 % (~2000 rpm) |
+| 90-100 % | HIGH 100 % (~4200 rpm) |
+
+On the way down it switches at 45 % (MID -> LOW) and 85 % (HIGH -> MID), so
+a request hovering at a threshold doesn't flap. `MIN` raises the LOW level
+if a blower needs more than 30 % to keep running; 20-60 % all run the same
+speed, so the default 30 % costs nothing.
+
+### Tach while chopped
+
+The blower's tach output comes from its own driver chip, which runs off the
+chopped supply, so it is only trustworthy at 0 % and 100 %; at LOW and MID
+the falling-edge counter overreads. At those levels the firmware samples
+instead: 3 s and 10 s after reaching a level (slowing down takes several
+seconds), then every 30 s, it runs the blower
+at 100 % for at most 70 ms (usually 20-50 ms), times two tach edges, and
+reports that rpm. The tach is valid within a millisecond of steady power and
+the impeller barely speeds up in that time, so the sample matches the real
+speed. A sample with no edges (or under 1000 rpm) is retried after 2 s;
+three misses in a row start the stall recovery below.
 
 ## Host daemon
 
@@ -102,7 +130,7 @@ On macOS use the `/dev/cu.*` port, not `/dev/tty.*`.
 | Event | Result |
 |---|---|
 | GPU unreadable (NVML error, card lost) | that blower to `fail_duty` (100 %) |
-| Blower stops (tach 0 while running) | firmware recovery kicks; after 3, held at 100 % and logged as STALLED |
+| Blower stops (tach 0 at 100 %, or 3 failed samples at LOW / MID) | firmware recovery kicks; after 3, held at 100 % and logged as STALLED |
 | fanctl stops / host hangs | after 10 s: both blowers 100 % |
 | Controller powers up / resets | both blowers 100 % until the first `SET` |
 | Firmware hangs | watchdog reset; drivers asleep during reset, then 100 % |

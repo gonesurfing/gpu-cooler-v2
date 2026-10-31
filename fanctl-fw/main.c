@@ -1,5 +1,5 @@
 /*
- * fanctl firmware v2.1 - XIAO RP2040, two blowers, USB CDC control
+ * fanctl firmware v2.2 - XIAO RP2040, two blowers, USB CDC control
  *
  * Driver stage (pick at build time, cmake -DFANCTL_DRIVER=...):
  *   DRV8871  (default) One DRV8871 per blower. IN1 <- EN (GP6, shared),
@@ -22,22 +22,45 @@
  *   TACH <t1> [<t2>]   1 = blower has tach (enables stall
  *                      recovery), 0 = none; saved to flash        -> CFG
  *   CFG                                                           -> CFG
- *   ID                                                            -> ID FANCTL 2.1 <driver>
+ *   PROBE <ms> [<f>]   debug: blower f (default 1) at 100 % for ms,
+ *                      tach falling-edge times in ms              -> PROBE
+ *   ID                                                            -> ID FANCTL 2.2 <driver>
  *
- *   STAT mode=HOST d1=45 rpm1=1820 st1=OK d2=60 rpm2=1950 st2=OK
+ *   STAT mode=HOST d1=70 rpm1=2040 st1=OK d2=30 rpm2=1280 st2=OK
  *   CFG min1=30 min2=30 tach1=1 tach2=1
+ *   PROBE fan=1 ms=50 n=3 t=2.62,26.46,50.01
  *
  *   mode: HOST | LOST (no SET yet, or none for HOST_TIMEOUT_MS; both blowers 100 %)
+ *   d:    output level actually applied (see speed levels), not the request
  *   st:   OFF   duty 0
  *         OK    running
  *         KICK  start-up or recovery kick at 100 %
- *         STALL tach shows 0 after STALL_RETRIES recovery kicks; held at
+ *         STALL no tach after STALL_RETRIES recovery kicks; held at
  *               100 %, retried every STALL_RETRY_MS, clears when tach returns
  *
- * Stall recovery (only for channels with tach enabled): if a running blower
- * shows 0 rpm for STALL_DETECT_MS, it gets RECOVER_KICK_MS at 100 % and then
- * returns to its setting. The request is honoured in the reported duty
- * throughout; st= shows what the output is actually doing.
+ * Speed levels: with its supply chopped, the BFB1012HH only runs at a few
+ * distinct speeds (~1280 rpm anywhere from 20-60 %, ~2000-2450 at 70-90 %,
+ * ~4200 at 100 %), and at 80-90 % its speed depends on whether it came from
+ * above or below. Requests are therefore mapped onto three levels, with
+ * hysteresis so a request near a threshold doesn't flap:
+ *   LOW  30 %   request 1-49   (back down from MID below 45)
+ *   MID  70 %   request 50-89  (back down from HIGH below 85)
+ *   HIGH 100 %  request 90-100
+ *
+ * Tach: the blower's tach output is only valid while its supply is steady.
+ * At 0 % and 100 % the falling-edge counter is used continuously. At LOW and
+ * MID the counter overreads, so the blower is briefly bumped to 100 % (at
+ * most PROBE_MAX_MS, ending after two tach edges) PROBE_SETTLE_MS after the
+ * level is reached, again PROBE_FOLLOWUP_MS later (slowing down to a lower
+ * level takes several seconds), and then every PROBE_INTERVAL_MS; rpm is the
+ * time between the two edges, and STAT reports the last such sample.
+ *
+ * Stall recovery (only for channels with tach enabled): a running blower
+ * that shows 0 rpm for STALL_DETECT_MS on the counter, or fails
+ * PROBE_FAILS samples in a row (retried every PROBE_RETRY_MS), gets
+ * RECOVER_KICK_MS at 100 % and then returns to its setting. The level is
+ * honoured in the reported duty throughout; st= shows what the output is
+ * actually doing.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,12 +101,30 @@
 #define HOST_TIMEOUT_MS    10000
 #define LOST_DUTY          100     /* duty with no host */
 
-#define DEFAULT_MIN_DUTY   30      /* until calibrated with MIN */
+#define LEVEL_LOW          30
+#define LEVEL_MID          70
+#define LEVEL_HIGH         100
+#define MID_UP             50      /* request >= this: LOW -> MID */
+#define MID_DOWN           45      /* request <  this: MID -> LOW */
+#define HIGH_UP            90      /* request >= this: -> HIGH */
+#define HIGH_DOWN          85      /* request <  this: HIGH -> MID */
+
+#define DEFAULT_MIN_DUTY   30      /* floor under LOW; MIN raises it */
 #define START_KICK_MS      1000    /* 100 % when starting from stop */
 #define RECOVER_KICK_MS    1500    /* 100 % after a detected stall */
 #define STALL_DETECT_MS    2000    /* 0 rpm this long while running = stall */
 #define STALL_RETRIES      3       /* recovery kicks before latching STALL */
 #define STALL_RETRY_MS     30000   /* latched: try normal duty again */
+
+#define PROBE_SETTLE_MS    3000    /* first sample after reaching a level */
+#define PROBE_FOLLOWUP_MS  7000    /* second sample, once the speed has settled */
+#define PROBE_STAGGER_MS   500     /* fan 2 samples this much after fan 1 */
+#define PROBE_INTERVAL_MS  30000
+#define PROBE_MAX_MS       70      /* two edges at 1000 rpm need <= 60 ms */
+#define PROBE_RETRY_MS     2000    /* after a failed sample */
+#define PROBE_FAILS        3       /* failed samples in a row = stall */
+#define PROBE_MIN_RPM      1000    /* slower than this counts as failed */
+#define PROBE_BLANK_US     300     /* ignore tach edges closer than this */
 
 /* ---------------- persistent settings (last flash sector) ---------------- */
 #define CFG_MAGIC   0x46414E31u               /* "FAN1" */
@@ -139,12 +180,17 @@ typedef enum { ST_OFF, ST_OK, ST_KICK, ST_STALL } fan_state_t;
 typedef struct {
     uint        pin_pwm, pin_tach, tach_slice;
     int         duty_set;        /* host request, % */
-    int         duty_out;        /* reported duty (target), % */
+    int         level;           /* LEVEL_* picked from the request, 0 = off */
+    int         duty_out;        /* reported duty (level after MIN), % */
     fan_state_t st;
+    bool        chopped;         /* output between 0 and 100 %: counter invalid */
     uint32_t    kick_until;      /* end of current kick */
-    uint32_t    watch_from;      /* ignore tach until this time (spin-up) */
+    uint32_t    watch_from;      /* ignore the tach counter until this time */
     uint32_t    zero_since;      /* first 0-rpm reading while running, 0 = none */
     uint32_t    stall_retry_at;  /* latched STALL: next normal-duty attempt */
+    uint32_t    probe_at;        /* next tach sample while chopped */
+    int         probe_fails;
+    bool        probe_settled;   /* follow-up sample done since the last change */
     int         retries;
     uint32_t    rpm;
 } fan_t;
@@ -198,18 +244,84 @@ static void tach_init(fan_t *f) {
     pwm_init(f->tach_slice, &c, true);
 }
 
+/* Drive the blower at 100 % for up to ms, timestamping tach falling edges
+ * (us from the start), stopping after max_edges. Blocks; leaves the output
+ * at 100 % - the caller restores it. */
+static int capture_edges(fan_t *f, int ms, uint32_t *edge_us, int max_edges) {
+    int n = 0;
+    watchdog_update();
+    set_level(f, 100);
+    uint32_t t0 = time_us_32(), last_fall = t0 - 1000000;
+    bool prev = gpio_get(f->pin_tach);
+    while (n < max_edges && time_us_32() - t0 < (uint32_t)ms * 1000) {
+        bool lvl = gpio_get(f->pin_tach);
+        uint32_t t = time_us_32();
+        if (prev && !lvl && t - last_fall >= PROBE_BLANK_US) {
+            edge_us[n++] = t - t0;
+            last_fall = t;
+        }
+        prev = lvl;
+    }
+    return n;
+}
+
+/* one tach sample while chopped: rpm from two edges, 0 if too slow / none */
+static uint32_t sample_rpm(fan_t *f) {
+    uint32_t e[2];
+    if (capture_edges(f, PROBE_MAX_MS, e, 2) < 2) return 0;
+    uint32_t rpm = 60000000u / ((e[1] - e[0]) * TACH_PULSES_PER_REV);
+    return rpm < PROBE_MIN_RPM ? 0 : rpm;
+}
+
 /* ---------------- control ---------------- */
+static int pick_level(int level, int req) {
+    if (req <= 0) return 0;
+    if (req >= HIGH_UP) return LEVEL_HIGH;
+    switch (level) {
+    case LEVEL_HIGH: return req < MID_DOWN ? LEVEL_LOW : req < HIGH_DOWN ? LEVEL_MID : LEVEL_HIGH;
+    case LEVEL_MID:  return req < MID_DOWN ? LEVEL_LOW : LEVEL_MID;
+    default:         return req >= MID_UP ? LEVEL_MID : LEVEL_LOW;
+    }
+}
+
 static int target_duty(int idx) {
-    int d = mode == MODE_HOST ? fans[idx].duty_set : LOST_DUTY;
+    fan_t *f = &fans[idx];
+    f->level = pick_level(f->level, mode == MODE_HOST ? f->duty_set : LOST_DUTY);
+    int d = f->level;
     if (d > 0 && d < cfg.min_duty[idx]) d = cfg.min_duty[idx];
     return d > 100 ? 100 : d;
 }
 
 static void kick(fan_t *f, uint32_t t, uint32_t ms) {
     f->st = ST_KICK;
+    f->chopped = false;
     f->kick_until = t + ms;
     f->zero_since = 0;
     set_level(f, 100);
+}
+
+/* back to normal running: give the tach time before trusting it again */
+static void resume(int idx, uint32_t t) {
+    fan_t *f = &fans[idx];
+    f->st = ST_OK;
+    f->watch_from = t + TACH_WINDOW_MS + 100;
+    f->probe_at = t + PROBE_SETTLE_MS + idx * PROBE_STAGGER_MS;
+    f->probe_fails = 0;
+    f->probe_settled = false;
+    f->zero_since = 0;
+}
+
+static void stalled(fan_t *f, uint32_t t) {
+    if (f->retries < STALL_RETRIES) {
+        f->retries++;
+        kick(f, t, RECOVER_KICK_MS);
+    } else {
+        f->st = ST_STALL;                          /* give up: hold 100 % */
+        f->chopped = false;
+        f->watch_from = t + TACH_WINDOW_MS + 100;  /* skip a window with chopped junk */
+        f->stall_retry_at = t + STALL_RETRY_MS;
+        set_level(f, 100);
+    }
 }
 
 static void update_fan(int idx) {
@@ -220,12 +332,14 @@ static void update_fan(int idx) {
 
     if (target == 0) {
         f->st = ST_OFF;
+        f->chopped = false;
         f->duty_out = 0;
         f->retries = 0;
         f->zero_since = 0;
         set_level(f, 0);
         return;
     }
+    if (f->st == ST_OK && target != f->duty_out) resume(idx, t);   /* new level */
     f->duty_out = target;
 
     switch (f->st) {
@@ -236,17 +350,14 @@ static void update_fan(int idx) {
 
     case ST_KICK:
         if (!after(t, f->kick_until)) return;      /* still kicking */
-        f->st = ST_OK;
-        /* give the tach a full measurement window at the new duty */
-        f->watch_from = t + TACH_WINDOW_MS + 100;
+        resume(idx, t);
         break;
 
     case ST_STALL:
         set_level(f, 100);
-        if (f->rpm > 0) {                          /* recovered */
-            f->st = ST_OK;
+        if (after(t, f->watch_from) && f->rpm > 0) {   /* recovered */
             f->retries = 0;
-            f->watch_from = t + TACH_WINDOW_MS + 100;
+            resume(idx, t);
         } else if (after(t, f->stall_retry_at)) {
             f->retries = 0;                        /* fresh round of kicks */
             kick(f, t, RECOVER_KICK_MS);
@@ -259,8 +370,29 @@ static void update_fan(int idx) {
 
     /* ST_OK: run at target, watch for a stall */
     set_level(f, target);
-    if (!tach || !after(t, f->watch_from)) { f->zero_since = 0; return; }
+    f->chopped = target < 100;
+    if (!tach) { f->zero_since = 0; return; }
 
+    if (f->chopped) {                              /* sampled tach */
+        if (!after(t, f->probe_at)) return;
+        f->rpm = sample_rpm(f);
+        set_level(f, target);
+        t = now_ms();
+        if (f->rpm > 0) {
+            f->probe_fails = 0;
+            f->retries = 0;
+            f->probe_at = t + (f->probe_settled ? PROBE_INTERVAL_MS : PROBE_FOLLOWUP_MS);
+            f->probe_settled = true;
+        } else if (++f->probe_fails < PROBE_FAILS) {
+            f->probe_at = t + PROBE_RETRY_MS;
+        } else {
+            stalled(f, t);
+        }
+        return;
+    }
+
+    /* 100 %: continuous counter */
+    if (!after(t, f->watch_from)) { f->zero_since = 0; return; }
     if (f->rpm > 0) {
         f->zero_since = 0;
         f->retries = 0;
@@ -268,15 +400,7 @@ static void update_fan(int idx) {
     }
     if (f->zero_since == 0) { f->zero_since = t | 1; return; }
     if (!after(t, f->zero_since + STALL_DETECT_MS)) return;
-
-    if (f->retries < STALL_RETRIES) {
-        f->retries++;
-        kick(f, t, RECOVER_KICK_MS);
-    } else {
-        f->st = ST_STALL;                          /* give up: hold 100 % */
-        f->stall_retry_at = t + STALL_RETRY_MS;
-        set_level(f, 100);
-    }
+    stalled(f, t);
 }
 
 static void update_all(void) { update_fan(0); update_fan(1); }
@@ -301,6 +425,17 @@ static void print_stat(void) {
 static void print_cfg(void) {
     printf("CFG min1=%u min2=%u tach1=%u tach2=%u\n",
            cfg.min_duty[0], cfg.min_duty[1], cfg.tach[0], cfg.tach[1]);
+}
+
+static void print_probe(int idx, int ms) {
+    uint32_t e[40];
+    int n = capture_edges(&fans[idx], ms, e, 40);
+    update_fan(idx);                               /* back to normal output */
+    printf("PROBE fan=%d ms=%d n=%d t=", idx + 1, ms, n);
+    for (int i = 0; i < n; i++)
+        printf("%s%lu.%02lu", i ? "," : "", (unsigned long)(e[i] / 1000),
+               (unsigned long)(e[i] % 1000 / 10));
+    printf("\n");
 }
 
 /* parse "<a> [<b>]" with each value in [lo, hi]; one value applies to both */
@@ -352,8 +487,14 @@ static void handle_line(char *s) {
         print_cfg();
     } else if (strcmp(s, "CFG") == 0) {
         print_cfg();
+    } else if (strncmp(s, "PROBE", 5) == 0) {
+        char *end;
+        long ms = strtol(s + 5, &end, 10);
+        long fan = *end ? strtol(end, &end, 10) : 1;
+        if (ms < 1 || ms > 500 || fan < 1 || fan > 2) { printf("ERR PROBE 1-500 [1|2]\n"); return; }
+        print_probe((int)fan - 1, (int)ms);
     } else if (strcmp(s, "ID") == 0) {
-        printf("ID FANCTL 2.1 %s\n", DRIVER_NAME);
+        printf("ID FANCTL 2.2 %s\n", DRIVER_NAME);
     } else if (*s) {
         printf("ERR unknown\n");
     }
@@ -405,7 +546,8 @@ int main(void) {
             for (int i = 0; i < 2; i++) {
                 uint16_t n = pwm_get_counter(fans[i].tach_slice);
                 pwm_set_counter(fans[i].tach_slice, 0);
-                fans[i].rpm = (uint32_t)n * 60000u / (dt * TACH_PULSES_PER_REV);
+                if (!fans[i].chopped)              /* chopped: last sample stands */
+                    fans[i].rpm = (uint32_t)n * 60000u / (dt * TACH_PULSES_PER_REV);
             }
             t_tach = t;
         }
