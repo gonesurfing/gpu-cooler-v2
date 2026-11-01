@@ -50,3 +50,8 @@ arrives, and whenever the daemon stops talking to it for 10 s, both blowers
 run at 100 %. A blower whose GPU can't be read also goes to full speed. If a
 blower stalls, the firmware kicks it at full power to restart it and, if that
 fails, holds it at 100 % and reports the stall to the daemon's log.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Provided as is, with no warranty: if your GPUs
+cook, that is on you.
